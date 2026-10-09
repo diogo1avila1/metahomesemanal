@@ -1,5 +1,5 @@
 /**
- * AUTOMAÇÃO - Indicador de Atendimento N2 -> Planilha "Meta semanal de atendimento - N2"  (v3-N2)
+ * AUTOMAÇÃO - Indicador de Atendimento N2 -> Planilha "Meta semanal de atendimento - N2"  (v4-N2)
  * ----------------------------------------------------------------------
  * Script VINCULADO à planilha N2 (Extensões > Apps Script).
  *
@@ -9,20 +9,18 @@
  *  2) Email semanal "Indicador - fila NOC - Nível 2 zerada - Últimos 7 dias: N - Meta: ..."
  *     -> grava N na célula "Fila zerada" do bloco da semana que terminou.
  *  3) Zera (0/0) dias sem email da semana, até a última data processada.
- *  4) A partir de segunda: calcula "Atendimento no plantão" (sáb+dom), desconsiderando
- *     perdidas concorrentes e perdidas fora das 08h-22h. Grava abaixo da Fila zerada.
+ *  4) A partir de segunda: calcula "Atendimento no plantão" (sáb+dom). Concorrentes e
+ *     perdidas fora das 08h-22h saem só das perdidas. Grava abaixo da Fila zerada.
+ *  5) (v4) Cria sozinho a aba do mês seguinte (ex.: Novembro/26) na última semana do mês,
+ *     com os blocos "Meta Semanal - DD a DD" já montados. Se a aba faltar, cria na hora.
+ *  6) (v4) Aceita o email diário de QUALQUER remetente (Bruno, Vagner...). Ignora respostas (Re:/Enc:).
  *
- * PRIMEIRA VEZ: rode criarCampoPlantao() (cria o campo) e depois
- * recalcularPlantaoUltimasSemanas() (preenche os fins de semana anteriores).
- *
- * Layout da planilha N2 (confirmado):
- *  - Abas "Mês/aa" (ex.: Setembro/26). A semana (sexta a quinta) fica na aba do mês
- *    que tem a maioria dos dias da semana (= mês da segunda-feira).
- *    Ex.: "28 a 03" (28/08-03/09) fica em Agosto/26; "25 a 02" (25/09-02/10) em Setembro/26.
- *  - Cabeçalho do bloco: "Meta Semanal - DD a DD" (sem mês).
- *  - Dias começam 2 linhas abaixo do cabeçalho; Total = +1 coluna; Abandonadas = +2 colunas.
- *  - SLA é fórmula (o script não mexe).
- *  - Valor da "Fila zerada" = 12 linhas abaixo do cabeçalho, mesma coluna do cabeçalho.
+ * Layout da planilha N2:
+ *  - Abas "Mês/aa". A semana (sexta a quinta) fica na aba do mês da segunda-feira
+ *    (maioria dos dias). Ex.: "25 a 02" (25/09-02/10) em Setembro/26.
+ *  - Bloco: cabeçalho "Meta Semanal - DD a DD"; dias +2..+8 linhas; Total +1 col; Abandonadas +2 col;
+ *    Fila zerada (valor) +12 linhas; Atendimento no plantão (valor) +14 linhas.
+ *  - Blocos em 2 colunas (B e G), um novo par a cada 16 linhas.
  *
  * Gatilho: processarIndicadores, 1x por dia às 9h (rode criarGatilho uma vez).
  */
@@ -31,7 +29,6 @@
 
 var SPREADSHEET_ID = ''; // vazio = planilha vinculada ao script (N2)
 
-var REMETENTE_DIARIO = 'bruno.duarte@hostfiber.com.br';
 var ASSUNTO_DIARIO = 'Indicador - Atendimento Telefonico - NOC - Nível 2';
 var ASSUNTO_FILA = 'Indicador - fila NOC - Nível 2 zerada - Últimos 7 dias';
 
@@ -57,6 +54,13 @@ var OFFSET_LINHA_PLANTAO_ROTULO = 13; // "Atendimento no plantão" (logo abaixo 
 var OFFSET_LINHA_PLANTAO = 14;        // valor (%)
 var OFFSET_COL_PLANTAO = 0;
 
+// Geometria dos blocos (usada para montar a aba de um mês novo)
+var BLOCO_ALTURA = 15;        // do cabeçalho até o valor do plantão
+var BLOCO_LARGURA = 4;        // B..E
+var BLOCO_PASSO_LINHAS = 16;  // distância entre cabeçalhos na vertical
+var BLOCO_PASSO_COLUNAS = 5;  // distância entre o bloco da esquerda (B) e o da direita (G)
+var DIAS_ANTES_CRIAR_ABA = 7; // cria a aba do próximo mês quando faltar 1 semana
+
 // Plantão de fim de semana: perdidas só contam das 8h às 22h; atendidas contam 24h
 var PLANTAO_HORA_INICIO_PERDIDAS = 8;
 var PLANTAO_HORA_FIM_PERDIDAS = 22;
@@ -67,6 +71,7 @@ var MAX_EMAILS_POR_EXECUCAO = 15;
 // ========================== FUNÇÕES PRINCIPAIS ==========================
 
 function processarIndicadores() {
+  garantirAbaProximaSemana_();
   var ultimaData = processarIndicadorDiario_();
   processarFilaZerada_();
   if (ultimaData) {
@@ -87,14 +92,25 @@ function criarGatilho() {
   ScriptApp.getProjectTriggers().forEach(function (t) {
     if (t.getHandlerFunction() === 'processarIndicadores') ScriptApp.deleteTrigger(t);
   });
-  ScriptApp.newTrigger('processarIndicadores').timeBased().everyDays(1).atHour(9).nearMinute(30).inTimezone('America/Sao_Paulo').create();
+  ScriptApp.newTrigger('processarIndicadores').timeBased().everyDays(1).atHour(9).nearMinute(30)
+      .inTimezone('America/Sao_Paulo').create();
+}
+
+/** Rode manualmente se quiser criar a aba do mês atual / próximo na hora. */
+function criarAbaProximoMes() {
+  var ss = getSS_();
+  var hoje = new Date();
+  garantirAbaDoMes_(ss, hoje.getFullYear(), hoje.getMonth());
+  var prox = new Date(hoje.getFullYear(), hoje.getMonth() + 1, 1);
+  garantirAbaDoMes_(ss, prox.getFullYear(), prox.getMonth());
 }
 
 // -------------------------- EMAIL DIÁRIO --------------------------
 
 function processarIndicadorDiario_() {
   var label = getOuCriarLabel_(LABEL_DIARIO);
-  var query = 'from:"' + REMETENTE_DIARIO + '" subject:"' + ASSUNTO_DIARIO + '" -label:"' + LABEL_DIARIO + '" newer_than:15d';
+  // Sem filtro de remetente: o email já veio do Bruno e do Vagner.
+  var query = 'subject:"' + ASSUNTO_DIARIO + '" -label:"' + LABEL_DIARIO + '" newer_than:15d';
   var threads = GmailApp.search(query, 0, MAX_EMAILS_POR_EXECUCAO);
 
   if (threads.length === 0) {
@@ -105,12 +121,12 @@ function processarIndicadorDiario_() {
   var dataMaisRecente = null;
 
   for (var t = 0; t < threads.length; t++) {
-    var mensagens = threads[t].getMessages();
-    var mensagem = mensagens[mensagens.length - 1];
+    var mensagem = mensagemOriginal_(threads[t]);
+    if (!mensagem) continue;
     var assunto = mensagem.getSubject();
 
     // Garante que é o email do N2 (e não o do NOC geral)
-    if (assunto.indexOf('Nível 2') === -1) {
+    if (assunto.indexOf(ASSUNTO_DIARIO) === -1) {
       Logger.log('Ignorado (não é N2): ' + assunto);
       continue;
     }
@@ -175,8 +191,8 @@ function processarFilaZerada_() {
   }
 
   for (var t = 0; t < threads.length; t++) {
-    var mensagens = threads[t].getMessages();
-    var mensagem = mensagens[mensagens.length - 1];
+    var mensagem = mensagemOriginal_(threads[t]);
+    if (!mensagem) continue;
     var assunto = mensagem.getSubject();
 
     var match = assunto.match(/(\d+)\s*-\s*Meta:/i);
@@ -227,11 +243,9 @@ function preencherDiasZerados_(ultimaData) {
 /**
  * Regra (plantonista sozinho no fim de semana):
  *  - Usa o "Detalhamento" (ligação a ligação) dos emails diários de sábado e domingo.
- *  - Atendidas: contam 24h.
  *  - Perdidas: só contam se começaram entre 08:00 e 21:59.
- *  - Perdida CONCORRENTE é desconsiderada: tocou enquanto o plantonista estava em
- *    linha com outra ligação (intervalo de toque [início, início+TE] cruza o intervalo
- *    em linha [início+TE, início+TE+TA] de uma atendida).
+ *  - Perdida CONCORRENTE: tocou enquanto o plantonista estava em linha com outra ligação
+ *    (intervalo de toque [início, início+TE] cruza o intervalo em linha [início+TE, início+TE+TA]).
  *  - % = (recebidas - perdidas válidas) / recebidas. Concorrentes e fora do horário
  *    saem só das perdidas (continuam no total de recebidas).
  * Roda na execução diária de segunda às 9h (email de domingo já chegou) e só grava
@@ -326,14 +340,13 @@ function calcularPlantao_(sabado, sobrescrever) {
 
 function buscarEmailDiarioPorData_(data) {
   var ref = 'Ref ' + fmt_(data);
-  var query = 'from:"' + REMETENTE_DIARIO + '" subject:"' + ASSUNTO_DIARIO + '" newer_than:40d';
+  var query = 'subject:"' + ASSUNTO_DIARIO + '" newer_than:40d';
   var threads = GmailApp.search(query, 0, 60);
   for (var t = 0; t < threads.length; t++) {
-    var msgs = threads[t].getMessages();
-    for (var i = msgs.length - 1; i >= 0; i--) {
-      var s = msgs[i].getSubject();
-      if (s.indexOf('Nível 2') !== -1 && s.indexOf(ref) !== -1) return msgs[i];
-    }
+    var msg = mensagemOriginal_(threads[t]);
+    if (!msg) continue;
+    var s = msg.getSubject();
+    if (s.indexOf(ASSUNTO_DIARIO) !== -1 && s.indexOf(ref) !== -1) return msg;
   }
   return null;
 }
@@ -366,11 +379,11 @@ function extrairChamadas_(html) {
 }
 
 /**
- * RODE UMA VEZ: cria o campo "Atendimento no plantão" logo abaixo da "Fila zerada"
- * em todos os blocos de todas as abas (insere 2 linhas; não duplica se já existir).
+ * RODE UMA VEZ (já rodado): cria o campo "Atendimento no plantão" logo abaixo da
+ * "Fila zerada" em todos os blocos de todas as abas (não duplica se já existir).
  */
 function criarCampoPlantao() {
-  var ss = SPREADSHEET_ID ? SpreadsheetApp.openById(SPREADSHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
   ss.getSheets().forEach(function (sheet) {
     var achados = sheet.createTextFinder('Fila zerada').matchEntireCell(true).findAll();
     if (!achados.length) return;
@@ -399,7 +412,95 @@ function criarCampoPlantao() {
   });
 }
 
+// -------------------------- CRIAÇÃO DA ABA DO MÊS --------------------------
+
+/** Na última semana do mês, garante que a aba do mês seguinte já exista. */
+function garantirAbaProximaSemana_() {
+  var d = new Date();
+  d.setDate(d.getDate() + DIAS_ANTES_CRIAR_ABA);
+  var seg = segundaDaSemana_(d);
+  garantirAbaDoMes_(getSS_(), seg.getFullYear(), seg.getMonth());
+}
+
+/**
+ * Cria a aba "Mês/aa" se não existir: copia a aba mais recente (mantém larguras/estilo),
+ * limpa tudo e monta um bloco por semana (sexta a quinta) cuja segunda-feira cai no mês.
+ */
+function garantirAbaDoMes_(ss, ano, mes) {
+  var nome = NOMES_MES[mes] + '/' + pad2_(ano % 100);
+  var existente = ss.getSheetByName(nome);
+  if (existente) return existente;
+
+  // Modelo: aba de mês anterior mais próxima que tenha blocos
+  var modelo = null, posModelo = null;
+  for (var k = 1; k <= 24 && !modelo; k++) {
+    var dm = new Date(ano, mes - k, 1);
+    var cand = ss.getSheetByName(NOMES_MES[dm.getMonth()] + '/' + pad2_(dm.getFullYear() % 100));
+    if (!cand) continue;
+    var heads = cand.createTextFinder('^\\s*Meta Semanal\\s*-').useRegularExpression(true).findAll();
+    if (heads.length) { modelo = cand; posModelo = heads; }
+  }
+  if (!modelo) {
+    Logger.log('Não criei "' + nome + '": nenhuma aba de mês anterior com blocos para usar de modelo.');
+    return null;
+  }
+
+  // Bloco de referência = o mais em cima / mais à esquerda
+  posModelo.sort(function (a, b) { return a.getRow() - b.getRow() || a.getColumn() - b.getColumn(); });
+  var r0 = posModelo[0].getRow(), c0 = posModelo[0].getColumn();
+  var blocoModelo = modelo.getRange(r0, c0, BLOCO_ALTURA, BLOCO_LARGURA);
+
+  var nova = modelo.copyTo(ss).setName(nome);
+  ss.setActiveSheet(nova);
+  ss.moveActiveSheet(modelo.getIndex() + 1);
+
+  // Limpa a cópia inteira
+  var tudo = nova.getRange(1, 1, nova.getMaxRows(), nova.getMaxColumns());
+  tudo.breakApart();
+  tudo.clear();
+  tudo.clearNote();
+
+  // Semanas do mês (sexta a quinta, pela segunda-feira)
+  var semanas = [];
+  var sexta = new Date(ano, mes, 1);
+  sexta.setDate(sexta.getDate() - 7);
+  sexta.setDate(sexta.getDate() + ((5 - sexta.getDay() + 7) % 7));
+  for (var i = 0; i < 7; i++) {
+    var s = new Date(sexta); s.setDate(sexta.getDate() + 7 * i);
+    var seg = new Date(s); seg.setDate(s.getDate() + 3);
+    if (seg.getMonth() === mes && seg.getFullYear() === ano) semanas.push(s);
+  }
+
+  semanas.forEach(function (ini, idx) {
+    var fim = new Date(ini); fim.setDate(ini.getDate() + 6);
+    var r = r0 + Math.floor(idx / 2) * BLOCO_PASSO_LINHAS;
+    var c = c0 + (idx % 2) * BLOCO_PASSO_COLUNAS;
+    blocoModelo.copyTo(nova.getRange(r, c)); // valores, fórmulas, formatos e mesclagens
+    nova.getRange(r, c).setValue('Meta Semanal - ' + pad2_(ini.getDate()) + ' a ' + pad2_(fim.getDate()));
+    nova.getRange(r + OFFSET_LINHA_PRIMEIRO_DIA, c + OFFSET_COL_TOTAL, 7, 2).clearContent();
+    nova.getRange(r + OFFSET_LINHA_FILA_ZERADA, c + OFFSET_COL_FILA_ZERADA).clearContent();
+    nova.getRange(r + OFFSET_LINHA_PLANTAO, c + OFFSET_COL_PLANTAO).clearContent().clearNote();
+  });
+
+  SpreadsheetApp.flush();
+  Logger.log('Aba criada: ' + nome + ' (' + semanas.length + ' semanas, modelo: ' + modelo.getName() + ')');
+  return nova;
+}
+
 // ========================== FUNÇÕES AUXILIARES ==========================
+
+function getSS_() {
+  return SPREADSHEET_ID ? SpreadsheetApp.openById(SPREADSHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
+}
+
+/** Primeira mensagem da conversa que não é resposta/encaminhamento (o email original). */
+function mensagemOriginal_(thread) {
+  var msgs = thread.getMessages();
+  for (var i = 0; i < msgs.length; i++) {
+    if (!/^\s*(re|res|fw|fwd|enc)\s*:/i.test(msgs[i].getSubject())) return msgs[i];
+  }
+  return null;
+}
 
 function getOuCriarLabel_(nome) {
   var label = GmailApp.getUserLabelByName(nome);
@@ -421,10 +522,18 @@ function quintaFeiraMaisProxima_(data) {
   return r;
 }
 
+/** Segunda-feira da semana (sexta a quinta) que contém a data. */
+function segundaDaSemana_(data) {
+  var inicio = new Date(data.getFullYear(), data.getMonth(), data.getDate());
+  inicio.setDate(inicio.getDate() - ((inicio.getDay() - 5 + 7) % 7)); // sexta
+  var seg = new Date(inicio); seg.setDate(inicio.getDate() + 3);
+  return seg;
+}
+
 /**
  * Semana sexta->quinta da data. Procura o bloco "Meta Semanal - DD a DD"
- * primeiro na aba do mês da segunda-feira (maioria dos dias), depois
- * nas abas do mês de início e de fim da semana, como reserva.
+ * primeiro na aba do mês da segunda-feira (criando a aba se não existir),
+ * depois nas abas do mês de início e de fim da semana, como reserva.
  */
 function localizarBlocoPorData_(data) {
   var inicio = new Date(data.getFullYear(), data.getMonth(), data.getDate());
@@ -432,7 +541,8 @@ function localizarBlocoPorData_(data) {
   var fim = new Date(inicio); fim.setDate(inicio.getDate() + 6);       // quinta
   var segunda = new Date(inicio); segunda.setDate(inicio.getDate() + 3);
 
-  var ss = SPREADSHEET_ID ? SpreadsheetApp.openById(SPREADSHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
+  var ss = getSS_();
+  garantirAbaDoMes_(ss, segunda.getFullYear(), segunda.getMonth());
 
   var textoExato = 'Meta Semanal - ' + pad2_(inicio.getDate()) + ' a ' + pad2_(fim.getDate());
   // Reserva: casa só pelo dia de início (tolera erro de digitação no dia final)
@@ -454,12 +564,12 @@ function localizarBlocoPorData_(data) {
     }
   }
 
-  Logger.log('Não achei "' + textoExato + '" nas abas: ' + abas.join(', '));
+  Logger.log('Não achei "' + textoExato + '" nas abas: ' + Object.keys(vistas).join(', '));
   return null;
 }
 
 function nomeAba_(d) {
-  return NOMES_MES[d.getMonth()] + '/' + Utilities.formatDate(d, Session.getScriptTimeZone(), 'yy');
+  return NOMES_MES[d.getMonth()] + '/' + pad2_(d.getFullYear() % 100);
 }
 
 function fmt_(d) {
