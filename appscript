@@ -1,0 +1,487 @@
+/**
+ * AUTOMAÇÃO - Indicador de Atendimento N2 -> Planilha "Meta semanal de atendimento - N2"  (v3-N2)
+ * ----------------------------------------------------------------------
+ * Script VINCULADO à planilha N2 (Extensões > Apps Script).
+ *
+ * O que faz:
+ *  1) Email diário "Indicador - Atendimento Telefonico - NOC - Nível 2 - Ref DD/MM/AA"
+ *     -> grava Total (Recebidas) e Abandonadas no dia correspondente do bloco semanal.
+ *  2) Email semanal "Indicador - fila NOC - Nível 2 zerada - Últimos 7 dias: N - Meta: ..."
+ *     -> grava N na célula "Fila zerada" do bloco da semana que terminou.
+ *  3) Zera (0/0) dias sem email da semana, até a última data processada.
+ *  4) A partir de segunda: calcula "Atendimento no plantão" (sáb+dom), desconsiderando
+ *     perdidas concorrentes e perdidas fora das 08h-22h. Grava abaixo da Fila zerada.
+ *
+ * PRIMEIRA VEZ: rode criarCampoPlantao() (cria o campo) e depois
+ * recalcularPlantaoUltimasSemanas() (preenche os fins de semana anteriores).
+ *
+ * Layout da planilha N2 (confirmado):
+ *  - Abas "Mês/aa" (ex.: Setembro/26). A semana (sexta a quinta) fica na aba do mês
+ *    que tem a maioria dos dias da semana (= mês da segunda-feira).
+ *    Ex.: "28 a 03" (28/08-03/09) fica em Agosto/26; "25 a 02" (25/09-02/10) em Setembro/26.
+ *  - Cabeçalho do bloco: "Meta Semanal - DD a DD" (sem mês).
+ *  - Dias começam 2 linhas abaixo do cabeçalho; Total = +1 coluna; Abandonadas = +2 colunas.
+ *  - SLA é fórmula (o script não mexe).
+ *  - Valor da "Fila zerada" = 12 linhas abaixo do cabeçalho, mesma coluna do cabeçalho.
+ *
+ * Gatilho: processarIndicadores, 1x por dia às 9h (rode criarGatilho uma vez).
+ */
+
+// ========================== CONFIGURAÇÃO ==========================
+
+var SPREADSHEET_ID = ''; // vazio = planilha vinculada ao script (N2)
+
+var REMETENTE_DIARIO = 'bruno.duarte@hostfiber.com.br';
+var ASSUNTO_DIARIO = 'Indicador - Atendimento Telefonico - NOC - Nível 2';
+var ASSUNTO_FILA = 'Indicador - fila NOC - Nível 2 zerada - Últimos 7 dias';
+
+// Etiquetas próprias do N2 (não conflitam com o script da planilha do NOC)
+var LABEL_DIARIO = 'N2-Indicador-Diario-Processado';
+var LABEL_FILA = 'N2-Indicador-Fila-Processado';
+
+var ORDEM_DIAS = ['sexta-feira', 'sábado', 'domingo', 'segunda-feira',
+                  'terça-feira', 'quarta-feira', 'quinta-feira'];
+
+var NOMES_MES = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho',
+                 'Julho', 'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
+
+var NOMES_DIA_SEMANA = ['domingo', 'segunda-feira', 'terça-feira', 'quarta-feira',
+                        'quinta-feira', 'sexta-feira', 'sábado'];
+
+var OFFSET_LINHA_PRIMEIRO_DIA = 2;
+var OFFSET_COL_TOTAL = 1;
+var OFFSET_COL_ABANDONADAS = 2;
+var OFFSET_LINHA_FILA_ZERADA = 12;
+var OFFSET_COL_FILA_ZERADA = 0;
+var OFFSET_LINHA_PLANTAO_ROTULO = 13; // "Atendimento no plantão" (logo abaixo da Fila zerada)
+var OFFSET_LINHA_PLANTAO = 14;        // valor (%)
+var OFFSET_COL_PLANTAO = 0;
+
+// Plantão de fim de semana: perdidas só contam das 8h às 22h; atendidas contam 24h
+var PLANTAO_HORA_INICIO_PERDIDAS = 8;
+var PLANTAO_HORA_FIM_PERDIDAS = 22;
+var ROTULO_PLANTAO = 'Atendimento no plantão';
+
+var MAX_EMAILS_POR_EXECUCAO = 15;
+
+// ========================== FUNÇÕES PRINCIPAIS ==========================
+
+function processarIndicadores() {
+  var ultimaData = processarIndicadorDiario_();
+  processarFilaZerada_();
+  if (ultimaData) {
+    preencherDiasZerados_(ultimaData);
+  }
+  verificarPlantaoFimDeSemana_();
+}
+
+function testarTudo() {
+  processarIndicadores();
+}
+
+/**
+ * Cria o gatilho DIÁRIO às 9h (rode uma vez só; apaga gatilhos antigos desta função).
+ * O Google executa perto de 9:30 (±15 min), depois que os emails das ~9:12 chegam.
+ */
+function criarGatilho() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'processarIndicadores') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('processarIndicadores').timeBased().everyDays(1).atHour(9).nearMinute(30).inTimezone('America/Sao_Paulo').create();
+}
+
+// -------------------------- EMAIL DIÁRIO --------------------------
+
+function processarIndicadorDiario_() {
+  var label = getOuCriarLabel_(LABEL_DIARIO);
+  var query = 'from:"' + REMETENTE_DIARIO + '" subject:"' + ASSUNTO_DIARIO + '" -label:"' + LABEL_DIARIO + '" newer_than:15d';
+  var threads = GmailApp.search(query, 0, MAX_EMAILS_POR_EXECUCAO);
+
+  if (threads.length === 0) {
+    Logger.log('Nenhum email diário novo para processar.');
+    return null;
+  }
+
+  var dataMaisRecente = null;
+
+  for (var t = 0; t < threads.length; t++) {
+    var mensagens = threads[t].getMessages();
+    var mensagem = mensagens[mensagens.length - 1];
+    var assunto = mensagem.getSubject();
+
+    // Garante que é o email do N2 (e não o do NOC geral)
+    if (assunto.indexOf('Nível 2') === -1) {
+      Logger.log('Ignorado (não é N2): ' + assunto);
+      continue;
+    }
+
+    var dataRef = extrairDataRef_(assunto);
+    if (!dataRef) {
+      Logger.log('Pulei email (não consegui ler a data): ' + assunto);
+      continue;
+    }
+
+    var linhas = extrairTabelaHtml_(mensagem.getBody());
+    var linhaTotal = null;
+    for (var i = 0; i < linhas.length; i++) {
+      if (linhas[i][0] && linhas[i][0].trim() === 'Total') {
+        linhaTotal = linhas[i];
+        break;
+      }
+    }
+
+    // Colunas do email: Hora | Recebidas | Atendidas | Abandonadas | ...
+    var recebidas = 0, abandonadas = 0;
+    if (linhaTotal) {
+      recebidas = parseInt(linhaTotal[1], 10) || 0;
+      abandonadas = parseInt(linhaTotal[3], 10) || 0;
+    } else {
+      Logger.log('Email sem linha "Total" — gravando 0/0: ' + assunto);
+    }
+
+    var bloco = localizarBlocoPorData_(dataRef);
+    if (!bloco) {
+      Logger.log('Bloco da semana não encontrado para ' + fmt_(dataRef) + ' (' + assunto + ')');
+      continue;
+    }
+
+    var offsetDia = ORDEM_DIAS.indexOf(NOMES_DIA_SEMANA[dataRef.getDay()]);
+    var linhaAlvo = bloco.headerRow + OFFSET_LINHA_PRIMEIRO_DIA + offsetDia;
+
+    bloco.sheet.getRange(linhaAlvo, bloco.headerCol + OFFSET_COL_TOTAL).setValue(recebidas);
+    bloco.sheet.getRange(linhaAlvo, bloco.headerCol + OFFSET_COL_ABANDONADAS).setValue(abandonadas);
+
+    Logger.log('Diário ' + fmt_(dataRef) + ' -> ' + bloco.sheet.getName() + ' linha ' + linhaAlvo +
+        ' (Total ' + recebidas + ', Abandonadas ' + abandonadas + ')');
+
+    threads[t].addLabel(label);
+
+    if (!dataMaisRecente || dataRef > dataMaisRecente) dataMaisRecente = dataRef;
+  }
+
+  return dataMaisRecente;
+}
+
+// -------------------------- FILA ZERADA (única fila do N2) --------------------------
+
+function processarFilaZerada_() {
+  var label = getOuCriarLabel_(LABEL_FILA);
+  var query = 'subject:"' + ASSUNTO_FILA + '" -label:"' + LABEL_FILA + '" newer_than:15d';
+  var threads = GmailApp.search(query, 0, MAX_EMAILS_POR_EXECUCAO);
+
+  if (threads.length === 0) {
+    Logger.log('Nenhum email de fila zerada novo.');
+    return;
+  }
+
+  for (var t = 0; t < threads.length; t++) {
+    var mensagens = threads[t].getMessages();
+    var mensagem = mensagens[mensagens.length - 1];
+    var assunto = mensagem.getSubject();
+
+    var match = assunto.match(/(\d+)\s*-\s*Meta:/i);
+    if (!match) {
+      Logger.log('Pulei (não achei o número antes de "- Meta:"): ' + assunto);
+      continue;
+    }
+    var valor = parseInt(match[1], 10);
+
+    // Relatório chega na sexta e se refere à semana que terminou (quinta anterior)
+    var dataAncora = quintaFeiraMaisProxima_(mensagem.getDate());
+
+    var bloco = localizarBlocoPorData_(dataAncora);
+    if (!bloco) {
+      Logger.log('Bloco não encontrado para a fila zerada (' + assunto + ')');
+      continue;
+    }
+
+    var linha = bloco.headerRow + OFFSET_LINHA_FILA_ZERADA;
+    bloco.sheet.getRange(linha, bloco.headerCol + OFFSET_COL_FILA_ZERADA).setValue(valor);
+
+    Logger.log('Fila zerada = ' + valor + ' -> ' + bloco.sheet.getName() + ' linha ' + linha);
+
+    threads[t].addLabel(label);
+  }
+}
+
+// -------------------------- ZERAR DIAS SEM EMAIL --------------------------
+
+function preencherDiasZerados_(ultimaData) {
+  var bloco = localizarBlocoPorData_(ultimaData);
+  if (!bloco) return;
+
+  var offsetUltimoDia = ORDEM_DIAS.indexOf(NOMES_DIA_SEMANA[ultimaData.getDay()]);
+
+  for (var offset = 0; offset <= offsetUltimoDia; offset++) {
+    var linha = bloco.headerRow + OFFSET_LINHA_PRIMEIRO_DIA + offset;
+    var celulaTotal = bloco.sheet.getRange(linha, bloco.headerCol + OFFSET_COL_TOTAL);
+    if (celulaTotal.getValue() === '') {
+      celulaTotal.setValue(0);
+      bloco.sheet.getRange(linha, bloco.headerCol + OFFSET_COL_ABANDONADAS).setValue(0);
+      Logger.log('Dia sem email zerado: linha ' + linha + ' em ' + bloco.sheet.getName());
+    }
+  }
+}
+
+// -------------------------- ATENDIMENTO NO PLANTÃO (SÁB + DOM) --------------------------
+/**
+ * Regra (plantonista sozinho no fim de semana):
+ *  - Usa o "Detalhamento" (ligação a ligação) dos emails diários de sábado e domingo.
+ *  - Atendidas: contam 24h.
+ *  - Perdidas: só contam se começaram entre 08:00 e 21:59.
+ *  - Perdida CONCORRENTE é desconsiderada: tocou enquanto o plantonista estava em
+ *    linha com outra ligação (intervalo de toque [início, início+TE] cruza o intervalo
+ *    em linha [início+TE, início+TE+TA] de uma atendida).
+ *  - % = (recebidas - perdidas válidas) / recebidas. Concorrentes e fora do horário
+ *    saem só das perdidas (continuam no total de recebidas).
+ * Roda na execução diária de segunda às 9h (email de domingo já chegou) e só grava
+ * se a célula estiver vazia. Detalhes ficam na nota da célula.
+ */
+function verificarPlantaoFimDeSemana_() {
+  var hoje = new Date();
+  var hoje0 = new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate());
+  // Último domingo ANTES de hoje (na segunda = ontem)
+  var domingo = new Date(hoje0);
+  domingo.setDate(hoje0.getDate() - (hoje0.getDay() === 0 ? 7 : hoje0.getDay()));
+  var sabado = new Date(domingo); sabado.setDate(domingo.getDate() - 1);
+  calcularPlantao_(sabado, false);
+}
+
+/** Rode manualmente para (re)calcular os 4 últimos fins de semana (sobrescreve). */
+function recalcularPlantaoUltimasSemanas() {
+  var hoje = new Date();
+  var d = new Date(hoje.getFullYear(), hoje.getMonth(), hoje.getDate());
+  d.setDate(d.getDate() - (d.getDay() === 0 ? 7 : d.getDay())); // último domingo
+  for (var i = 0; i < 4; i++) {
+    var sab = new Date(d); sab.setDate(d.getDate() - 1 - 7 * i);
+    calcularPlantao_(sab, true);
+  }
+}
+
+function calcularPlantao_(sabado, sobrescrever) {
+  var domingo = new Date(sabado); domingo.setDate(sabado.getDate() + 1);
+
+  var bloco = localizarBlocoPorData_(sabado);
+  if (!bloco) { Logger.log('Plantão: bloco não encontrado para ' + fmt_(sabado)); return; }
+
+  var cel = bloco.sheet.getRange(bloco.headerRow + OFFSET_LINHA_PLANTAO, bloco.headerCol + OFFSET_COL_PLANTAO);
+  var rotulo = bloco.sheet.getRange(bloco.headerRow + OFFSET_LINHA_PLANTAO_ROTULO, bloco.headerCol + OFFSET_COL_PLANTAO).getValue();
+  if (String(rotulo).trim() !== ROTULO_PLANTAO) {
+    Logger.log('Plantão: campo "' + ROTULO_PLANTAO + '" não existe no bloco de ' + fmt_(sabado) + ' (' + bloco.sheet.getName() + '). Rode criarCampoPlantao().');
+    return;
+  }
+  if (!sobrescrever && cel.getValue() !== '') return; // já calculado
+
+  var msgSab = buscarEmailDiarioPorData_(sabado);
+  var msgDom = buscarEmailDiarioPorData_(domingo);
+  if (!msgSab || !msgDom) {
+    Logger.log('Plantão ' + fmt_(sabado) + '/' + fmt_(domingo) + ': aguardando email de ' + (!msgSab ? 'sábado ' : '') + (!msgDom ? 'domingo' : ''));
+    return;
+  }
+
+  var chamadas = extrairChamadas_(msgSab.getBody()).concat(extrairChamadas_(msgDom.getBody()));
+
+  var ocupado = []; // intervalos em linha (ms)
+  var atendidas = 0, ramais = {};
+  chamadas.forEach(function (c) {
+    if (c.atendida) {
+      atendidas++;
+      var ini = c.inicio.getTime() + c.te * 1000;
+      ocupado.push([ini, ini + c.ta * 1000]);
+      if (c.ramal) ramais[c.ramal] = (ramais[c.ramal] || 0) + 1;
+    }
+  });
+
+  var perdidasValidas = 0, concorrentes = 0, foraHorario = 0, listaPerdidas = [];
+  chamadas.forEach(function (c) {
+    if (c.atendida) return;
+    var h = c.inicio.getHours();
+    if (h < PLANTAO_HORA_INICIO_PERDIDAS || h >= PLANTAO_HORA_FIM_PERDIDAS) { foraHorario++; return; }
+    var ringIni = c.inicio.getTime();
+    var ringFim = ringIni + Math.max(c.te, 1) * 1000;
+    var conc = ocupado.some(function (o) { return ringIni < o[1] && ringFim > o[0]; });
+    if (conc) { concorrentes++; return; }
+    perdidasValidas++;
+    listaPerdidas.push(Utilities.formatDate(c.inicio, Session.getScriptTimeZone(), 'dd/MM HH:mm'));
+  });
+
+  // Concorrentes e fora do horário saem APENAS das perdidas; o total de recebidas continua cheio.
+  var totalRecebidas = chamadas.length;
+  if (totalRecebidas === 0) {
+    cel.setValue('Sem chamadas');
+  } else {
+    cel.setValue((totalRecebidas - perdidasValidas) / totalRecebidas).setNumberFormat('0.00%');
+  }
+
+  var nota = 'Plantão ' + fmt_(sabado) + ' e ' + fmt_(domingo) + '\n' +
+      'Recebidas (total): ' + chamadas.length + ' | Atendidas: ' + atendidas + '\n' +
+      'Perdidas válidas (08-22h): ' + perdidasValidas + (listaPerdidas.length ? ' [' + listaPerdidas.join(', ') + ']' : '') + '\n' +
+      'Perdidas concorrentes (desconsideradas): ' + concorrentes + '\n' +
+      'Perdidas fora do horário (desconsideradas): ' + foraHorario + '\n' +
+      'Ramal(is) que atenderam: ' + (Object.keys(ramais).map(function (r) { return r + ' (' + ramais[r] + ')'; }).join(', ') || '-') + '\n' +
+      'Calculado em ' + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd/MM/yy HH:mm');
+  cel.setNote(nota);
+  Logger.log(nota.replace(/\n/g, ' | ') + ' -> ' + bloco.sheet.getName() + ' linha ' + cel.getRow());
+}
+
+function buscarEmailDiarioPorData_(data) {
+  var ref = 'Ref ' + fmt_(data);
+  var query = 'from:"' + REMETENTE_DIARIO + '" subject:"' + ASSUNTO_DIARIO + '" newer_than:40d';
+  var threads = GmailApp.search(query, 0, 60);
+  for (var t = 0; t < threads.length; t++) {
+    var msgs = threads[t].getMessages();
+    for (var i = msgs.length - 1; i >= 0; i--) {
+      var s = msgs[i].getSubject();
+      if (s.indexOf('Nível 2') !== -1 && s.indexOf(ref) !== -1) return msgs[i];
+    }
+  }
+  return null;
+}
+
+/** Lê a tabela "Detalhamento" (calldate | ... | dstchannel | disposition | TA | TE | audio). */
+function extrairChamadas_(html) {
+  var linhas = extrairTabelaHtml_(html);
+  var idx = { calldate: 0, dstchannel: 5, disposition: 6, TA: 7, TE: 8 };
+  var chamadas = [];
+  for (var i = 0; i < linhas.length; i++) {
+    var l = linhas[i];
+    if (l[0] === 'calldate') {
+      for (var k in idx) { var p = l.indexOf(k); if (p !== -1) idx[k] = p; }
+      continue;
+    }
+    var m = (l[idx.calldate] || '').match(/^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+    if (!m) continue;
+    var disp = (l[idx.disposition] || '').toUpperCase();
+    var canal = l[idx.dstchannel] || '';
+    var r = canal.match(/\/(\d+)-/);
+    chamadas.push({
+      inicio: new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]),
+      atendida: disp === 'ANSWERED',
+      ta: parseInt(l[idx.TA], 10) || 0,
+      te: parseInt(l[idx.TE], 10) || 0,
+      ramal: r ? r[1] : ''
+    });
+  }
+  return chamadas;
+}
+
+/**
+ * RODE UMA VEZ: cria o campo "Atendimento no plantão" logo abaixo da "Fila zerada"
+ * em todos os blocos de todas as abas (insere 2 linhas; não duplica se já existir).
+ */
+function criarCampoPlantao() {
+  var ss = SPREADSHEET_ID ? SpreadsheetApp.openById(SPREADSHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
+  ss.getSheets().forEach(function (sheet) {
+    var achados = sheet.createTextFinder('Fila zerada').matchEntireCell(true).findAll();
+    if (!achados.length) return;
+    var porLinha = {};
+    achados.forEach(function (c) {
+      (porLinha[c.getRow()] = porLinha[c.getRow()] || []).push(c.getColumn());
+    });
+    var linhas = Object.keys(porLinha).map(Number).sort(function (a, b) { return b - a; }); // de baixo pra cima
+    linhas.forEach(function (r) {
+      var cols = porLinha[r];
+      var jaTem = cols.every(function (c) {
+        return String(sheet.getRange(r + 2, c).getValue()).trim() === ROTULO_PLANTAO;
+      });
+      if (jaTem) return;
+      sheet.insertRowsAfter(r + 1, 2);
+      sheet.getRange(r + 2, 1, 2, sheet.getMaxColumns()).clearFormat();
+      cols.forEach(function (c) {
+        sheet.getRange(r, c).copyTo(sheet.getRange(r + 2, c), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+        sheet.getRange(r + 1, c).copyTo(sheet.getRange(r + 3, c), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+        sheet.getRange(r + 2, c).setValue(ROTULO_PLANTAO).setWrap(true);
+        sheet.getRange(r + 3, c).setNumberFormat('0.00%');
+      });
+      sheet.setRowHeight(r + 2, 32);
+    });
+    Logger.log('Campo de plantão criado/confirmado em ' + sheet.getName());
+  });
+}
+
+// ========================== FUNÇÕES AUXILIARES ==========================
+
+function getOuCriarLabel_(nome) {
+  var label = GmailApp.getUserLabelByName(nome);
+  if (!label) label = GmailApp.createLabel(nome);
+  return label;
+}
+
+function extrairDataRef_(assunto) {
+  var match = assunto.match(/Ref (\d{2})\/(\d{2})\/(\d{2})/);
+  if (!match) return null;
+  return new Date(2000 + parseInt(match[3], 10), parseInt(match[2], 10) - 1, parseInt(match[1], 10));
+}
+
+/** Quinta-feira na mesma data ou anterior. */
+function quintaFeiraMaisProxima_(data) {
+  var diff = (data.getDay() - 4 + 7) % 7;
+  var r = new Date(data.getFullYear(), data.getMonth(), data.getDate());
+  r.setDate(r.getDate() - diff);
+  return r;
+}
+
+/**
+ * Semana sexta->quinta da data. Procura o bloco "Meta Semanal - DD a DD"
+ * primeiro na aba do mês da segunda-feira (maioria dos dias), depois
+ * nas abas do mês de início e de fim da semana, como reserva.
+ */
+function localizarBlocoPorData_(data) {
+  var inicio = new Date(data.getFullYear(), data.getMonth(), data.getDate());
+  inicio.setDate(inicio.getDate() - ((inicio.getDay() - 5 + 7) % 7)); // sexta
+  var fim = new Date(inicio); fim.setDate(inicio.getDate() + 6);       // quinta
+  var segunda = new Date(inicio); segunda.setDate(inicio.getDate() + 3);
+
+  var ss = SPREADSHEET_ID ? SpreadsheetApp.openById(SPREADSHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
+
+  var textoExato = 'Meta Semanal - ' + pad2_(inicio.getDate()) + ' a ' + pad2_(fim.getDate());
+  // Reserva: casa só pelo dia de início (tolera erro de digitação no dia final)
+  var regexInicio = '^\\s*Meta Semanal\\s*-\\s*' + pad2_(inicio.getDate()) + '\\s*a\\s*\\d{1,2}\\s*$';
+
+  var abas = [nomeAba_(segunda), nomeAba_(inicio), nomeAba_(fim)];
+  var vistas = {};
+
+  for (var i = 0; i < abas.length; i++) {
+    if (vistas[abas[i]]) continue;
+    vistas[abas[i]] = true;
+    var sheet = ss.getSheetByName(abas[i]);
+    if (!sheet) continue;
+
+    var cel = sheet.createTextFinder(textoExato).matchEntireCell(true).findNext();
+    if (!cel) cel = sheet.createTextFinder(regexInicio).useRegularExpression(true).findNext();
+    if (cel) {
+      return { sheet: sheet, headerRow: cel.getRow(), headerCol: cel.getColumn() };
+    }
+  }
+
+  Logger.log('Não achei "' + textoExato + '" nas abas: ' + abas.join(', '));
+  return null;
+}
+
+function nomeAba_(d) {
+  return NOMES_MES[d.getMonth()] + '/' + Utilities.formatDate(d, Session.getScriptTimeZone(), 'yy');
+}
+
+function fmt_(d) {
+  return Utilities.formatDate(d, Session.getScriptTimeZone(), 'dd/MM/yy');
+}
+
+function pad2_(n) {
+  return n < 10 ? '0' + n : '' + n;
+}
+
+function extrairTabelaHtml_(html) {
+  var linhas = [];
+  var trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
+  var trMatch;
+  while ((trMatch = trRegex.exec(html)) !== null) {
+    var celulas = [];
+    var tdRegex = /<t[dh][^>]*>([\s\S]*?)<\/t[dh]>/gi;
+    var tdMatch;
+    while ((tdMatch = tdRegex.exec(trMatch[1])) !== null) {
+      celulas.push(tdMatch[1].replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim());
+    }
+    if (celulas.length > 0) linhas.push(celulas);
+  }
+  return linhas;
+}
